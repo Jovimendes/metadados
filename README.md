@@ -23,5 +23,6 @@ Aplicativo desktop em Python/Tkinter para alterar a data e/ou o local GPS dos me
 - O app usa o ExifTool instalado em `C:\Program Files\ExifToolGUI\exiftool.exe`.
 - A busca de cidade usa o servico publico Nominatim/OpenStreetMap e precisa de internet.
 - O ExifTool altera os arquivos originais diretamente, sem criar backup `_original`.
-- Arquivos buscados recursivamente: JPG, JPEG, TIF, TIFF, PNG, HEIC, HEIF, WEBP, MOV, MPG e MPEG.
+- Arquivos buscados recursivamente: JPG, JPEG, TIF, TIFF, PNG, HEIC, HEIF, WEBP, MOV, MPG e MPEG, MP4
+- Adicionado progressão de aplicação de metadados
 - Em videos `.mpg` e `.mpeg`, a capacidade de escrita dos metadados pode depender do formato interno do arquivo.
