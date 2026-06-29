@@ -24,10 +24,12 @@ IMAGE_EXTENSIONS = {
 }
 VIDEO_EXTENSIONS = {
     ".mov",
+    ".mp4",
     ".mpg",
     ".mpeg",
 }
 MEDIA_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
+CLEAR_LOCATION = "clear_location"
 
 MONTH_NAMES = [
     "Janeiro",
@@ -93,6 +95,25 @@ def get_gps(item):
 
 def is_video(path):
     return path.suffix.lower() in VIDEO_EXTENSIONS
+
+
+def split_file_batches(files, base_args, max_command_chars=24000, max_batch_files=None):
+    base_length = len(subprocess.list2cmdline([str(arg) for arg in base_args]))
+    batch = []
+    batch_length = base_length
+    for path in files:
+        path_arg = str(path)
+        path_length = len(subprocess.list2cmdline([path_arg])) + 1
+        batch_is_full = max_batch_files and len(batch) >= max_batch_files
+        command_is_long = batch_length + path_length > max_command_chars
+        if batch and (batch_is_full or command_is_long):
+            yield batch
+            batch = []
+            batch_length = base_length
+        batch.append(path)
+        batch_length += path_length
+    if batch:
+        yield batch
 
 
 class DatePicker(tk.Toplevel):
@@ -210,6 +231,7 @@ class ExifMetadataApp(tk.Tk):
         self.change_date_var = tk.BooleanVar(value=True)
         self.change_location_var = tk.BooleanVar(value=True)
         self.status_var = tk.StringVar(value="Selecione uma pasta para comecar.")
+        self.progress_var = tk.DoubleVar(value=0)
         self.files = []
         self.selected_files = {}
         self.coordinates = None
@@ -288,7 +310,14 @@ class ExifMetadataApp(tk.Tk):
         action_bar.grid(row=4, column=0, sticky="ew")
         action_bar.columnconfigure(0, weight=1)
         ttk.Label(action_bar, textvariable=self.status_var).grid(row=0, column=0, sticky="w")
-        ttk.Button(action_bar, text="Aplicar metadados na pasta", command=self.apply_metadata).grid(row=0, column=1, sticky="e")
+        ttk.Progressbar(
+            action_bar,
+            variable=self.progress_var,
+            maximum=100,
+            mode="determinate",
+            length=180,
+        ).grid(row=0, column=1, sticky="e", padx=(8, 12))
+        ttk.Button(action_bar, text="Aplicar metadados na pasta", command=self.apply_metadata).grid(row=0, column=2, sticky="e")
 
     def validate_exiftool(self):
         if not EXIFTOOL.exists():
@@ -320,7 +349,7 @@ class ExifMetadataApp(tk.Tk):
         media_files = [path for path in folder.rglob("*") if path.suffix.lower() in MEDIA_EXTENSIONS]
         rows = []
         if media_files:
-            args = [
+            base_args = [
                 str(EXIFTOOL),
                 "-json",
                 "-n",
@@ -336,18 +365,36 @@ class ExifMetadataApp(tk.Tk):
                 "-GPSLongitude",
                 "-GPSPosition",
                 "-GPSCoordinates",
-                *[str(path) for path in media_files],
             ]
-            result = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace")
-            metadata = json.loads(result.stdout or "[]") if result.returncode == 0 else []
+            metadata = []
+            errors = []
+            try:
+                for batch in split_file_batches(media_files, base_args):
+                    args = [*base_args, *[str(path) for path in batch]]
+                    result = subprocess.run(
+                        args,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                    )
+                    if result.stdout.strip():
+                        metadata.extend(json.loads(result.stdout))
+                    if result.returncode != 0:
+                        errors.append(result.stderr.strip() or "Falha ao ler um lote de arquivos.")
+            except (OSError, json.JSONDecodeError) as exc:
+                self.after(0, lambda error=str(exc): self.scan_failed(error))
+                return
+
+            if errors and not metadata:
+                self.after(0, lambda: self.scan_failed("\n\n".join(errors)))
+                return
             metadata_by_source = {
                 normalize_path_key(item.get("SourceFile", "")): item
                 for item in metadata
             }
-            for index, media_file in enumerate(media_files):
+            for media_file in media_files:
                 item = metadata_by_source.get(normalize_path_key(media_file))
-                if not item and index < len(metadata):
-                    item = metadata[index]
                 if not item:
                     item = {}
                 photo_date = first_present(
@@ -371,6 +418,10 @@ class ExifMetadataApp(tk.Tk):
                 rows.append((media_file, photo_date, location, city))
 
         self.after(0, lambda: self.populate_table(rows))
+
+    def scan_failed(self, output):
+        self.set_ready("Falha ao ler arquivos e metadados.")
+        messagebox.showerror("Erro ao carregar pasta", output or "Nao foi possivel ler os arquivos.")
 
     def populate_table(self, rows):
         self.files = [row[0] for row in rows]
@@ -579,10 +630,14 @@ class ExifMetadataApp(tk.Tk):
 
         coordinates = None
         if self.change_location_var.get():
-            if not self.coordinates:
+            if not self.city_var.get().strip():
+                self.coordinates = None
+                coordinates = CLEAR_LOCATION
+            elif not self.coordinates:
                 messagebox.showwarning("Local sem coordenadas", "Pesquise uma cidade valida antes de aplicar o local.")
                 return
-            coordinates = self.coordinates
+            else:
+                coordinates = self.coordinates
 
         confirm = messagebox.askyesno(
             "Confirmar alteracao",
@@ -592,19 +647,30 @@ class ExifMetadataApp(tk.Tk):
         if not confirm:
             return
 
-        self.set_busy("Aplicando metadados...")
+        self.progress_var.set(0)
+        self.set_busy(f"Aplicando metadados... 0% (0/{len(selected_files)})")
         threading.Thread(target=self.apply_worker, args=(date_value, coordinates, selected_files), daemon=True).start()
 
     def apply_worker(self, date_value, coordinates, selected_files):
         image_files = [path for path in selected_files if not is_video(path)]
         video_files = [path for path in selected_files if is_video(path)]
+        total_files = len(selected_files)
+        processed_files = 0
         outputs = []
         errors = []
+
+        def report_progress(done_in_batch):
+            nonlocal processed_files
+            processed_files += done_in_batch
+            percent = round((processed_files / total_files) * 100) if total_files else 100
+            text = f"Aplicando metadados... {percent}% ({processed_files}/{total_files})"
+            self.after(0, lambda: self.set_apply_progress(percent, text))
 
         if image_files:
             result = self.run_exiftool_update(
                 self.build_image_update_args(date_value, coordinates),
                 image_files,
+                progress_callback=report_progress,
             )
             outputs.append(result.stdout.strip())
             if result.returncode != 0:
@@ -614,6 +680,7 @@ class ExifMetadataApp(tk.Tk):
             result = self.run_exiftool_update(
                 self.build_video_update_args(date_value, coordinates),
                 video_files,
+                progress_callback=report_progress,
             )
             outputs.append(result.stdout.strip())
             if result.returncode != 0:
@@ -633,7 +700,9 @@ class ExifMetadataApp(tk.Tk):
                 f"-CreateDate={date_value}",
                 f"-ModifyDate={date_value}",
             ])
-        if coordinates:
+        if coordinates == CLEAR_LOCATION:
+            args.extend(self.build_clear_location_args(include_video_tags=False))
+        elif coordinates:
             lat, lon = coordinates
             args.extend([
                 f"-GPSLatitude={abs(lat)}",
@@ -657,7 +726,9 @@ class ExifMetadataApp(tk.Tk):
                 f"-XMP:ModifyDate={date_value}",
                 f"-XMP:DateCreated={date_value}",
             ])
-        if coordinates:
+        if coordinates == CLEAR_LOCATION:
+            args.extend(self.build_clear_location_args(include_video_tags=True))
+        elif coordinates:
             lat, lon = coordinates
             signed_coordinates = f"{lat:.8f} {lon:.8f}"
             args.extend([
@@ -670,10 +741,55 @@ class ExifMetadataApp(tk.Tk):
             ])
         return args
 
-    def run_exiftool_update(self, update_args, files):
-        args = [str(EXIFTOOL), "-P", "-overwrite_original", *update_args]
-        args.extend(str(path) for path in files)
-        return subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    def build_clear_location_args(self, include_video_tags):
+        args = [
+            "-GPS:all=",
+            "-XMP:GPSLatitude=",
+            "-XMP:GPSLongitude=",
+            "-XMP:GPSLatitudeRef=",
+            "-XMP:GPSLongitudeRef=",
+        ]
+        if include_video_tags:
+            args.extend([
+                "-Keys:GPSCoordinates=",
+                "-UserData:GPSCoordinates=",
+                "-QuickTime:GPSCoordinates=",
+            ])
+        return args
+
+    def run_exiftool_update(self, update_args, files, progress_callback=None):
+        base_args = [str(EXIFTOOL), "-P", "-overwrite_original", *update_args]
+        outputs = []
+        errors = []
+        return_code = 0
+        try:
+            for batch in split_file_batches(files, base_args, max_batch_files=1):
+                args = [*base_args, *[str(path) for path in batch]]
+                result = subprocess.run(
+                    args,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                if result.stdout.strip():
+                    outputs.append(result.stdout.strip())
+                if result.stderr.strip():
+                    errors.append(result.stderr.strip())
+                if result.returncode != 0:
+                    return_code = result.returncode
+                if progress_callback:
+                    progress_callback(len(batch))
+        except OSError as exc:
+            return_code = 1
+            errors.append(str(exc))
+
+        return subprocess.CompletedProcess(
+            args=base_args,
+            returncode=return_code,
+            stdout="\n".join(outputs),
+            stderr="\n".join(errors),
+        )
 
     def apply_finished(self, output):
         self.set_ready("Metadados aplicados. Recarregando tabela...")
@@ -684,12 +800,20 @@ class ExifMetadataApp(tk.Tk):
         self.set_ready("Falha ao aplicar metadados.")
         messagebox.showerror("Erro do ExifTool", output.strip() or "O ExifTool retornou erro.")
 
+    def set_apply_progress(self, percent, text):
+        self.progress_var.set(percent)
+        self.status_var.set(text)
+
     def set_busy(self, text):
         self.status_var.set(text)
+        if not text.startswith("Aplicando metadados"):
+            self.progress_var.set(0)
         self.config(cursor="watch")
 
     def set_ready(self, text):
         self.status_var.set(text)
+        if not text.startswith("Metadados aplicados"):
+            self.progress_var.set(0)
         self.config(cursor="")
 
 
